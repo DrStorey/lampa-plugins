@@ -1,0 +1,291 @@
+(function () {
+    'use strict';
+
+    if (window.lampa_skip_v7) return;
+    window.lampa_skip_v7 = true;
+
+    var TIDB_API = 'https://api.theintrodb.org/v2/media';
+    var TIDB_KEY = 'theintrodb:user_3BfEUxCEHvAV12Kb1oJOjyNfLUr:4QnTxxv-Os1HM1dtC82DPej_J8UxULTNBQyN6JyrTzI';
+    var ANISKIP  = 'https://api.aniskip.com/v2/skip-times';
+    var JIKAN    = 'https://api.jikan.moe/v4/anime';
+    var GH_DB    = 'https://raw.githubusercontent.com/ipavlin98/lmp-series-skip-db/refs/heads/main/database/';
+    var IDB_API  = 'https://api.introdb.app/intro';
+    var C_KEY    = 'skip_cache_v6';
+    var O_KEY    = 'skip_off_v6';
+
+    // External Android players are launched in another Activity.  The current
+    // LAMPA bridge only exposes AndroidJS.openPlayer(); it has no position or
+    // seek method while that Activity is active. Keep this capability record
+    // public so a future native bridge can be detected without guessing APIs.
+    var ExternalPlayers = {
+        vimu: {
+            packages: ['net.gtvbox.videoplayer','net.gtvbox.vimuhd','net.gtvbox.vimu'],
+            startPosition: ['startfrom','position'],
+            resultAction: ['net.gtvbox.videoplayer.result','net.gtvbox.vimuhd.result'],
+            runtimePosition: false,
+            runtimeSeek: false,
+            segments: false,
+            callbackWhilePlaying: false,
+            support: 'UNSUPPORTED_EXTERNAL'
+        },
+        ddd: {
+            packages: ['top.rootu.dddplayer'],
+            startPosition: ['position'],
+            resultAction: ['top.rootu.dddplayer.intent.result.VIEW'],
+            runtimePosition: false,
+            runtimeSeek: false,
+            segments: false,
+            callbackWhilePlaying: false,
+            support: 'UNSUPPORTED_EXTERNAL'
+        }
+    };
+    window.LampaSerialSkipExternalPlayers = ExternalPlayers;
+
+    // ─── Утилиты ───
+    function cid(c) { return c?(c.id||c.kinopoisk_id||c.kp_id||c.imdb_id||null):null; }
+    function kid(c) { return c?(c.kinopoisk_id||(c.source==='kinopoisk'?c.id:null)||c.kp_id||null):null; }
+    function iid(c) { return c?(c.imdb_id||null):null; }
+    function tid(c) { return c?(c.id||c.tmdb_id||null):null; }
+    function isAni(c){ if(!c) return false; var l=(c.original_language||'').toLowerCase(); return l==='ja'||l==='zh'||l==='cn'||(c.genres&&c.genres.some(function(g){return g.id===16;})); }
+    function isTrl(t){ return ['трейлер','trailer','тизер','teaser'].some(function(k){return (t||'').toLowerCase().indexOf(k)>=0;}); }
+    function playerVideo(){
+        try {
+            if (Lampa.PlayerVideo && Lampa.PlayerVideo.video) return Lampa.PlayerVideo.video();
+            if (Lampa.Player && Lampa.Player.Video && Lampa.Player.Video.video) return Lampa.Player.Video.video();
+        } catch(e) {}
+        return null;
+    }
+
+    function getOff(id){try{var o=Lampa.Storage.get(O_KEY,'{}');if(typeof o==='string')o=JSON.parse(o);return(id&&o[id])||0;}catch(e){return 0;}}
+    function setOff(id,v){try{var o=Lampa.Storage.get(O_KEY,'{}');if(typeof o==='string')o=JSON.parse(o);if(v===0)delete o[id];else o[id]=v;Lampa.Storage.set(O_KEY,JSON.stringify(o));}catch(e){}}
+    function aOff(s,off){if(!s||!off)return s;return s.map(function(x){return{start:Math.max(0,x.start+off),end:Math.max(0,x.end+off),name:x.name};});}
+
+    var CC={
+        get:function(k){try{var c=Lampa.Storage.get(C_KEY,'{}');if(typeof c==='string')c=JSON.parse(c);var i=c[k];if(!i||Date.now()-(i.t||0)>604800000)return null;return i.d;}catch(e){return null;}},
+        set:function(k,d){try{var c=Lampa.Storage.get(C_KEY,'{}');if(typeof c==='string')c=JSON.parse(c);c[k]={d:d,t:Date.now()};var ks=Object.keys(c);if(ks.length>800){ks.sort(function(a,b){return(c[a].t||0)-(c[b].t||0);});ks.slice(0,ks.length-600).forEach(function(x){delete c[x];});}Lampa.Storage.set(C_KEY,JSON.stringify(c));}catch(e){}}
+    };
+
+    function hasS(o){return o&&o.segments&&o.segments.skip&&o.segments.skip.length>0;}
+
+    function getPos(p){
+        if(p.episode||p.e||p.episode_number) return{s:parseInt(p.season||p.s||1),e:parseInt(p.episode||p.e||p.episode_number)};
+        if(p.playlist&&Array.isArray(p.playlist)&&p.url){var i=p.playlist.findIndex(function(x){return x.url===p.url;});if(i!==-1){var it=p.playlist[i];return{s:parseInt(it.season||it.s||1),e:parseInt(it.episode||it.e||it.episode_number||(i+1))};}}
+        try{var a=Lampa.Activity.active(),m=a&&(a.movie||a.card);if(m){var l=Lampa.Storage.get('online_watched_last','{}');if(typeof l==='string')l=JSON.parse(l);var h=Lampa.Utils.hash(m.original_title||m.original_name||m.title||'');if(l[h])return{s:l[h].season||1,e:l[h].episode||1};}}catch(e){}
+        return{s:1,e:1};
+    }
+
+    // ─── Тост ───
+    var Toast={_el:null,_t:null,show:function(text,ms){ms=ms||2500;if(!this._el){var s=document.createElement('style');s.textContent='.skt{position:fixed;top:12px;left:50%;transform:translateX(-50%) translateY(-40px);z-index:9999999;padding:7px 18px;background:rgba(0,0,0,0.7);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border-radius:18px;color:rgba(255,255,255,0.75);font-size:0.8em;font-family:inherit;pointer-events:none;opacity:0;transition:all 0.3s;white-space:nowrap}.skt.v{opacity:1;transform:translateX(-50%) translateY(0)}';document.head.appendChild(s);this._el=document.createElement('div');this._el.className='skt';document.body.appendChild(this._el);}clearTimeout(this._t);this._el.textContent=text;this._el.classList.add('v');var self=this;this._t=setTimeout(function(){self._el.classList.remove('v');},ms);}};
+
+    // ─── Кнопка ───
+    var Btn={
+        _el:null,_iv:null,_seg:null,_vis:false,_css:false,
+        _style:function(){if(this._css)return;this._css=true;var s=document.createElement('style');s.textContent='.skb{position:fixed;bottom:70px;right:20px;z-index:9999999;display:flex;align-items:center;gap:6px;padding:8px 16px 8px 12px;background:rgba(255,255,255,0.1);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border:1px solid rgba(255,255,255,0.1);border-radius:6px;color:rgba(255,255,255,0.85);font-size:0.85em;font-weight:500;font-family:inherit;cursor:pointer;user-select:none;opacity:0;transform:translateX(16px);transition:opacity 0.2s,transform 0.2s,background 0.12s;pointer-events:none}.skb.v{opacity:1;transform:translateX(0);pointer-events:auto}.skb:hover,.skb.f{background:rgba(255,255,255,0.18)}.skb svg{width:14px;height:14px;flex-shrink:0}';document.head.appendChild(s);},
+        _mk:function(){if(this._el)return;this._style();var b=document.createElement('div');b.className='skb';b.innerHTML='<svg viewBox="0 0 24 24" fill="none"><path d="M5 4l10 8-10 8V4z" fill="currentColor"/><rect x="17" y="4" width="3" height="16" rx="1" fill="currentColor"/></svg><span></span>';document.body.appendChild(b);var self=this;b.addEventListener('click',function(e){e.stopPropagation();e.preventDefault();self._do();});try{$(b).on('hover:enter',function(){self._do();});}catch(e){}this._el=b;},
+        _do:function(){if(!this._seg)return;try{var v=playerVideo();if(v)v.currentTime=Math.min(v.duration||99999,this._seg.end);}catch(e){}Toast.show((this._seg.name||'Сегмент')+' пропущен',2000);this._seg._sk=true;this.hide();},
+        show:function(seg){this._mk();this._seg=seg;this._el.querySelector('span').textContent=seg.name||'Пропустить';this._el.classList.add('v');this._vis=true;},
+        hide:function(){if(this._el)this._el.classList.remove('v');this._vis=false;this._seg=null;},
+        start:function(segs){var self=this;self.stop();if(!segs||!segs.length)return;self._iv=setInterval(function(){try{var v=playerVideo();if(!v)return;var t=v.currentTime||0;var found=null;for(var i=0;i<segs.length;i++){if(!segs[i]._sk&&t>=segs[i].start&&t<=segs[i].end){found=segs[i];break;}}if(found){if(!self._vis||self._seg!==found)self.show(found);}else{if(self._vis)self.hide();}}catch(e){}},400);},
+        stop:function(){if(this._iv){clearInterval(this._iv);this._iv=null;}this.hide();}
+    };
+
+    // ─── Источники ───
+    function src1(tmdb,s,e){return new Promise(function(ok){if(!tmdb)return ok(null);var url=TIDB_API+'?tmdb_id='+tmdb;if(s)url+='&season='+s;if(e)url+='&episode='+e;try{fetch(url,{headers:{'Authorization':'Bearer '+TIDB_KEY}}).then(function(r){return r.ok?r.json():null;}).then(function(d){if(!d)return ok(null);var out=[];if(d.segments&&Array.isArray(d.segments)){d.segments.forEach(function(x){if(x.start!==undefined&&x.end!==undefined){var t=(x.type||'').toLowerCase();out.push({start:x.start,end:x.end,name:t==='intro'?'Заставка':t==='credits'||t==='outro'?'Титры':t==='recap'?'Рекап':t==='preview'?'Превью':'Пропустить'});}});}else if(typeof d.start==='number'&&typeof d.end==='number'){out.push({start:d.start,end:d.end,name:'Заставка'});}ok(out.length?out:null);})['catch'](function(){ok(null);});}catch(e){ok(null);}});}
+
+    function src2(kp){return new Promise(function(ok){try{fetch(GH_DB+kp+'.json').then(function(r){return r.ok?r.json():null;}).then(ok)['catch'](function(){ok(null);});}catch(e){ok(null);}});}
+    function src2s(db,s,e){if(!db)return null;s=String(s);e=String(e);if(db[s]&&db[s][e])return db[s][e];if(s==='1'&&e==='1'&&db.movie)return db.movie;return db.movie||null;}
+
+    function src3(imdb,s,e){return new Promise(function(ok){if(!imdb)return ok(null);var url=IDB_API+'?imdb='+encodeURIComponent(imdb);if(s)url+='&season='+s;if(e)url+='&episode='+e;try{fetch(url).then(function(r){return r.ok?r.json():null;}).then(function(d){ok(d&&typeof d.start==='number'&&typeof d.end==='number'?[{start:d.start,end:d.end,name:'Заставка'}]:null);})['catch'](function(){ok(null);});}catch(e){ok(null);}});}
+
+    function src4m(title,season,year){return new Promise(function(ok){var q=title;if(season>1)q+=' Season '+season;try{fetch(JIKAN+'?q='+encodeURIComponent(q)+'&limit=10').then(function(r){return r.json();}).then(function(j){if(!j.data||!j.data.length)return ok(null);if(year&&season===1){var m=j.data.find(function(i){var y=i.year;if(!y&&i.aired&&i.aired.from)y=i.aired.from.substring(0,4);return String(y)===String(year);});if(m)return ok(m.mal_id);}ok(j.data[0].mal_id);})['catch'](function(){ok(null);});}catch(e){ok(null);}});}
+
+    function src4(mal,ep){return new Promise(function(ok){var url=ANISKIP+'/'+mal+'/'+ep+'?types=op&types=ed&types=recap&episodeLength=0';try{fetch(url).then(function(r){return r.status===404?{found:false}:r.json();}).then(function(d){if(d.found&&d.results&&d.results.length){var out=[];d.results.forEach(function(x){if(!x.interval)return;var t=(x.skipType||'').toLowerCase();var st=x.interval.startTime!==undefined?x.interval.startTime:x.interval.start_time;var en=x.interval.endTime!==undefined?x.interval.endTime:x.interval.end_time;if(st!==undefined&&en!==undefined)out.push({start:st,end:en,name:t.indexOf('op')>=0?'Опенинг':t.indexOf('ed')>=0?'Эндинг':t==='recap'?'Рекап':'Пропустить'});});ok(out);}else ok([]);})['catch'](function(){ok([]);});}catch(e){ok([]);}});}
+
+    // ─── Поиск ───
+    function find(card,season,ep){
+        var t=tid(card),k=kid(card),im=iid(card),c=cid(card);
+        var serial=card.number_of_seasons>0||(card.original_name&&!card.original_title);
+        if(!serial){season=1;ep=1;}
+        var ck=[c,season,ep].join('_');
+        var cached=CC.get(ck);
+        if(cached&&cached.length){var off=getOff(c);return Promise.resolve(off?aOff(cached,off):cached.slice());}
+
+        var res=[],src='';
+        var ch=Promise.resolve();
+
+        if(t){ch=ch.then(function(){if(res.length)return;return src1(t,serial?season:null,serial?ep:null).then(function(s){if(s&&s.length){res=s;src='TIDB';}});});}
+        if(isAni(card)){ch=ch.then(function(){if(res.length)return;var n=(card.original_name||card.original_title||card.name||'').replace(/\(\d{4}\)/g,'').replace(/\(TV\)/gi,'').replace(/Season \d+/gi,'').replace(/[:\-]/g,' ').replace(/\s+/g,' ').trim();var y=(card.release_date||card.first_air_date||'0000').slice(0,4);return src4m(n,season,y).then(function(mal){if(!mal)return;return src4(mal,ep).then(function(s){if(s&&s.length){res=s;src='AniSkip';}});});});}
+        if(k){ch=ch.then(function(){if(res.length)return;return src2(k).then(function(db){if(!db)return;var s=src2s(db,season,ep);if(s&&s.length){res=s.slice();src='KP DB';}});});}
+        if(im){ch=ch.then(function(){if(res.length)return;return src3(im,serial?season:null,serial?ep:null).then(function(s){if(s&&s.length){res=s;src='IntroDB';}});});}
+
+        return ch.then(function(){
+            if(res.length){var off=getOff(c);if(off)res=aOff(res,off);CC.set(ck,res);Toast.show(src+' \u2192 S'+season+'E'+ep,2500);}
+            return res;
+        })['catch'](function(){return[];});
+    }
+
+    // ─── Offset меню ───
+    function initMenu(){
+        Lampa.Lang.add({sso:{ru:'Смещение меток',en:'Skip offset',uk:'Зміщення міток'},sss:{ru:'сек',en:'sec',uk:'сек'}});
+        Lampa.Controller.listener.follow('toggle',function(ev){
+            if(ev.name!=='select')return;var a=Lampa.Activity.active(),co=a&&a.component?a.component.toLowerCase():'';
+            if(co!=='lamponline'&&co!=='lampacskaz')return;
+            var $t=$('.selectbox__title');if($t.length!==1||$t.text()!==Lampa.Lang.translate('title_filter'))return;
+            if($('.selectbox-item[data-sso]').length>0)return;
+            var card=a.movie||a.card,c=cid(card);if(!c)return;
+            var cur=getOff(c),txt=cur===0?'0':(cur>0?'+'+cur:String(cur));
+            var $i=Lampa.Template.get('selectbox_item',{title:Lampa.Lang.translate('sso'),subtitle:txt+' '+Lampa.Lang.translate('sss')});
+            $i.attr('data-sso','1');
+            $i.on('hover:enter',function(){Lampa.Select.close();var items=[],vs=[-30,-20,-15,-10,-5,-3,-2,-1,0,1,2,3,5,10,15,20,30];vs.forEach(function(v){items.push({title:(v===0?'0':(v>0?'+'+v:v))+' '+Lampa.Lang.translate('sss'),value:v,selected:v===cur});});Lampa.Select.show({title:Lampa.Lang.translate('sso'),items:items,onBack:function(){Lampa.Controller.toggle('content');},onSelect:function(i){setOff(c,i.value);Toast.show(Lampa.Lang.translate('sso')+': '+(i.value===0?'0':(i.value>0?'+'+i.value:i.value))+' '+Lampa.Lang.translate('sss'));Lampa.Controller.toggle('content');}});});
+            var $l=$('.selectbox-item').last();if($l.length)$l.after($i);else $('body > .selectbox').find('.scroll__body').append($i);
+            Lampa.Controller.collectionSet($('body > .selectbox').find('.scroll__body'));
+        });
+    }
+
+    // ─── Главная функция: загрузить и запустить кнопку ───
+    function loadAndTrack(data) {
+        var card = data.card || data.movie || null;
+        if (!card) { var a = Lampa.Activity.active(); if(a) card = a.movie || a.card; }
+        if (!card) return;
+        if (isTrl(data.title || card.title || card.name || '')) return;
+
+        var pos = getPos(data);
+
+        find(card, pos.s, pos.e).then(function(segs) {
+            if (segs && segs.length) {
+                Btn.start(segs);
+            }
+        });
+    }
+
+    // ═══════════════════════════════════════
+    //  INIT — два механизма:
+    //  1) Player.play override — подставляет segments в params (работает для онлайн)
+    //  2) listener('ready') — фоллбэк для торрентов и случаев когда override не сработал
+    // ═══════════════════════════════════════
+    function init() {
+        initMenu();
+
+        // Отключаем нативный автопропуск — мы хотим только кнопку
+        Lampa.Storage.set('player_segments_ad', 'none');
+        Lampa.Storage.set('player_segments_skip', 'none');
+
+        // Переменная для хранения найденных сегментов между play и ready
+        var _pendingSegs = null;
+        var _pendingCard = null;
+
+        // === Метод 1: перехват Player.play (как в v3, работал для онлайн) ===
+        var origPlay = Lampa.Player.play;
+        var origPlaylist = Lampa.Player.playlist;
+        var pendingPL = null;
+
+        Lampa.Player.playlist = function(pl) { pendingPL = pl; origPlaylist.call(this, pl); };
+
+        Lampa.Player.play = function(params) {
+            var ctx = this;
+            if (params.url) { try { Lampa.PlayerPlaylist.url(params.url); } catch(e){} }
+            if (params.playlist && params.playlist.length) { try { Lampa.PlayerPlaylist.set(params.playlist); } catch(e){} }
+
+            // Определяем карточку
+            var card = params.movie || params.card || null;
+            if (!card) { var a = Lampa.Activity.active(); if(a) card = a.movie || a.card; }
+
+            if (!card || isTrl(params.title || '')) {
+                return origPlay.call(ctx, params);
+            }
+
+            if (hasS(params)) {
+                // Балансер уже дал сегменты — сохраняем для кнопки
+                _pendingSegs = params.segments.skip;
+                _pendingCard = card;
+                return origPlay.call(ctx, params);
+            }
+
+            var pos = getPos(params);
+            var serial = card.number_of_seasons > 0 || (card.original_name && !card.original_title);
+            var season = serial ? pos.s : 1;
+            var episode = serial ? pos.e : 1;
+
+            find(card, season, episode).then(function(segs) {
+                if (segs && segs.length) {
+                    // Подставляем в params — лампа подхватит через Segments.set
+                    // НО мы отключили авто-пропуск, так что Segments.set просто покажет полоски на таймлайне
+                    params.segments = params.segments || {};
+                    params.segments.skip = segs;
+                    _pendingSegs = segs;
+                    _pendingCard = card;
+
+                    // Предзагрузка плейлиста для GitHub DB
+                    if (params.playlist && Array.isArray(params.playlist) && kid(card)) {
+                        src2(kid(card)).then(function(db) {
+                            if (!db) return;
+                            var off = getOff(cid(card));
+                            params.playlist.forEach(function(item) {
+                                if (hasS(item)) return;
+                                var iS = item.season||item.s||season;
+                                var iE = item.episode||item.e||item.episode_number;
+                                if (iS && iE) {
+                                    var s2 = src2s(db, iS, iE);
+                                    if (s2) { item.segments = item.segments||{}; item.segments.skip = off ? aOff(s2,off) : s2.slice(); }
+                                }
+                            });
+                        });
+                    }
+                }
+
+                origPlay.call(ctx, params);
+                if (pendingPL) { try { Lampa.PlayerPlaylist.set(pendingPL); } catch(e){} pendingPL = null; }
+            })['catch'](function() {
+                origPlay.call(ctx, params);
+            });
+        };
+
+        // === Метод 2: listener('ready') — запускает кнопку всегда ===
+        Lampa.Player.listener.follow('ready', function(data) {
+            Btn.stop();
+
+            // Если мы уже нашли сегменты через play override
+            if (_pendingSegs && _pendingSegs.length) {
+                Btn.start(_pendingSegs);
+                _pendingSegs = null;
+                _pendingCard = null;
+                return;
+            }
+
+            // Фоллбэк: ищем сегменты здесь (для торрентов где play override мог не найти)
+            loadAndTrack(data);
+        });
+
+        // LAMPA sends this event immediately before switching to an external
+        // Android Activity. The segments remain in playback data (and playlist
+        // items), but LAMPA v1.12.4+ does not translate them to Vimu/DDD Intent
+        // extras and exposes no live position/seek bridge back to JavaScript.
+        // Therefore we stop DOM tracking and leave playback untouched.
+        Lampa.Player.listener.follow('external', function(data) {
+            Btn.stop();
+            var hasSegments = hasS(data) || (_pendingSegs && _pendingSegs.length);
+            if (hasSegments) {
+                Toast.show('Автопропуск недоступен во внешнем плеере', 3500);
+            }
+            try {
+                console.info('[SkipSegments] External player: runtime position/seek bridge unavailable; segments preserved in playback data');
+            } catch(e) {}
+        });
+
+        Lampa.Player.listener.follow('destroy', function() {
+            Btn.stop();
+            _pendingSegs = null;
+            _pendingCard = null;
+        });
+
+        console.log('[SkipSegments] v7 — serials-skip base + safe Vimu/DDD capability fallback');
+    }
+
+    if (window.Lampa && window.Lampa.Player) init();
+    else { var w = setInterval(function() { if (window.Lampa && window.Lampa.Player) { clearInterval(w); init(); } }, 200); }
+
+})();
+
+
+
+
